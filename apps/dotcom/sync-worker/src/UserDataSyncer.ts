@@ -72,17 +72,15 @@ type BootState =
 	  }
 	| {
 			type: 'connecting'
-			bootId: string
 			bufferedEvents: Array<ZReplicationEvent>
 	  }
 	| {
 			type: 'connected'
-			bootId: string
 			sequenceId: string
 			lastSequenceNumber: number
 	  }
 
-const stateVersion = 0
+const stateVersion = 1
 interface StateSnapshot {
 	version: number
 	initialData: ZStoreData
@@ -90,10 +88,28 @@ interface StateSnapshot {
 		updates: ZRowUpdate[]
 		mutationId: string
 	}>
+	// v1
+	sequenceId: string
+	lastSequenceNumber: number
+	timestamp: number
+}
+
+function migrateStateSnapshot(snapshot: StateSnapshot): void {
+	if (snapshot.version === 0) {
+		snapshot.version = 1
+		snapshot.sequenceId = ''
+		snapshot.lastSequenceNumber = 0
+		snapshot.timestamp = 0
+		if ('mutationNumber' in snapshot.initialData) {
+			// whoops we accidentally included this in initialData in previous versions
+			// let's remove it to be clean and tidy!
+			delete snapshot.initialData.mutationNumber
+		}
+	}
 }
 
 const MUTATION_COMMIT_TIMEOUT = 10_000
-const LSN_COMMIT_TIMEOUT = 120_000
+export const LSN_COMMIT_TIMEOUT = 120_000
 
 export class UserDataSyncer {
 	state: BootState = {
@@ -128,7 +144,9 @@ export class UserDataSyncer {
 		private log: Logger
 	) {
 		this.sentry = createSentry(ctx, env)
-		this.reboot({ delay: false, source: 'constructor' })
+		this.reboot({ delay: false, hard: true, source: 'constructor', forceRegister: false })
+		getReplicator(env).ping()
+
 		const persist = throttle(
 			async () => {
 				const initialData = this.store.getCommittedData()
@@ -137,6 +155,9 @@ export class UserDataSyncer {
 						version: stateVersion,
 						initialData,
 						optimisticUpdates: this.store.getOptimisticUpdates(),
+						sequenceId: this.state.type === 'connected' ? this.state.sequenceId : '',
+						lastSequenceNumber: this.state.type === 'connected' ? this.state.lastSequenceNumber : 0,
+						timestamp: Date.now(),
 					}
 					this.log.debug('stashing snapshot')
 					this.lastStashEpoch = this.store.epoch
@@ -160,13 +181,15 @@ export class UserDataSyncer {
 	numConsecutiveReboots = 0
 
 	async reboot({
-		delay = true,
-		hard = false,
+		delay,
+		hard,
 		source,
+		forceRegister,
 	}: {
-		delay?: boolean
-		hard?: boolean
+		delay: boolean
+		hard: boolean
 		source: string
+		forceRegister: boolean
 	}) {
 		this.numConsecutiveReboots++
 		if (this.numConsecutiveReboots > 8) {
@@ -184,7 +207,7 @@ export class UserDataSyncer {
 			const controller = new AbortController()
 			const signal = controller.signal
 			const res = await Promise.race([
-				this.boot(hard, signal)
+				this.boot({ hard, signal, forceRegister })
 					.then(() => 'ok' as const)
 					.catch((e) => {
 						this.logEvent({ type: 'reboot_error', id: this.userId })
@@ -201,7 +224,12 @@ export class UserDataSyncer {
 			if (res === 'ok') {
 				this.numConsecutiveReboots = 0
 			} else {
-				this.reboot({ hard: this.numConsecutiveReboots > 4, source: source + '_retry' })
+				this.reboot({
+					delay: true,
+					hard: this.numConsecutiveReboots > 4,
+					source: source + '_retry',
+					forceRegister: true,
+				})
 			}
 		})
 	}
@@ -226,11 +254,13 @@ export class UserDataSyncer {
 		}
 		const data = (await res.json()) as StateSnapshot
 		if (signal.aborted) return null
+		migrateStateSnapshot(data)
 		if (data.version !== stateVersion) {
 			this.log.debug('snapshot version mismatch')
 			return null
 		}
-		this.log.debug('loaded snapshot from R2')
+		const { lastSequenceNumber, sequenceId, timestamp } = data
+		this.log.debug('loaded snapshot from R2', { lastSequenceNumber, sequenceId, timestamp })
 		this.logEvent({ type: 'found_snapshot', id: this.userId })
 		return data
 	}
@@ -240,12 +270,11 @@ export class UserDataSyncer {
 		this.log.debug('fetching fresh initial data from postgres')
 		// if the bootId changes during the boot process, we should stop silently
 		const userSql = getFetchUserDataSql(this.userId)
-		const initialData: ZStoreData & { mutationNumber?: number } = {
+		const initialData: ZStoreData = {
 			user: null as any,
 			files: [],
 			fileStates: [],
 			lsn: '0/0',
-			mutationNumber: 0,
 		}
 		// we connect to pg via a pooler, so in the case that the pool is exhausted
 		// we need to retry the connection. (also in the case that a neon branch is asleep apparently?)
@@ -276,15 +305,6 @@ export class UserDataSyncer {
 								assert(typeof row.lsn === 'string', 'lsn should be a string')
 								initialData.lsn = row.lsn
 								break
-							case 'user_mutation_number':
-								assert(
-									typeof row.mutationNumber === 'number' || row.mutationNumber === null,
-									'mutationNumber should be a number or null, got' + JSON.stringify(row)
-								)
-								if (row.mutationNumber !== null) {
-									initialData.mutationNumber = row.mutationNumber
-								}
-								break
 						}
 					})
 				})
@@ -298,17 +318,27 @@ export class UserDataSyncer {
 			version: stateVersion,
 			initialData,
 			optimisticUpdates: [],
+			sequenceId: '',
+			lastSequenceNumber: 0,
+			timestamp: 0,
 		} satisfies StateSnapshot
 	}
 
-	private async boot(hard: boolean, signal: AbortSignal): Promise<void> {
-		this.log.debug('boot hard:', hard)
+	private async boot({
+		hard,
+		forceRegister,
+		signal,
+	}: {
+		hard: boolean
+		forceRegister: boolean
+		signal: AbortSignal
+	}): Promise<void> {
+		this.log.debug('booting', { hard, forceRegister })
 		// todo: clean up old resources if necessary?
 		const start = Date.now()
 		this.state = {
 			type: 'connecting',
 			// preserve the promise so any awaiters do eventually get resolved
-			bootId: uniqueId(),
 			bufferedEvents: [],
 		}
 		/**
@@ -322,35 +352,55 @@ export class UserDataSyncer {
 		 * 7. Once the replicator responds to the registration request, apply the buffered events
 		 */
 		if (!this.store.getCommittedData() || hard) {
-			const res =
-				(!hard && (await this.loadInitialDataFromR2(signal))) ||
-				(await this.loadInitialDataFromPostgres(hard, signal))
+			let res = null as
+				| { type: 'snapshot'; data: StateSnapshot }
+				| { type: 'postgres'; data: StateSnapshot }
+				| null
+			if (!hard) {
+				const data = await this.loadInitialDataFromR2(signal)
+				if (data) {
+					res = { type: 'snapshot', data }
+				}
+			}
+			if (!res) {
+				res = {
+					type: 'postgres' as const,
+					data: await this.loadInitialDataFromPostgres(hard, signal),
+				}
+			}
 
 			if (signal.aborted) return
 
 			this.log.debug('got initial data')
-			this.store.initialize(res.initialData, res.optimisticUpdates)
-			this.broadcast({
-				type: 'initial_data',
-				initialData: res.initialData,
-			})
-			if (
-				'mutationNumber' in res.initialData &&
-				typeof res.initialData.mutationNumber === 'number'
-			) {
-				this.commitMutations(res.initialData.mutationNumber)
+			this.store.initialize(res.data.initialData, res.data.optimisticUpdates)
+			this.broadcast({ type: 'initial_data', initialData: res.data.initialData })
+
+			if (res.type === 'postgres') {
+				// if we reset from postgres we have the latest data and optimistic updates
+				// can all be cleared.
+				this.commitMutations(+Infinity)
+			}
+
+			if (!hard && !forceRegister && Date.now() - res.data.timestamp < LSN_COMMIT_TIMEOUT * 2) {
+				this._completeBoot({
+					bufferedEvents: this.state.bufferedEvents,
+					sequenceId: res.data.sequenceId,
+					lastSequenceNumber: res.data.lastSequenceNumber,
+					start,
+				})
+				return
 			}
 		}
 
 		const initialData = this.store.getCommittedData()!
 
 		const guestFileIds = initialData.files.filter((f) => f.ownerId !== this.userId).map((f) => f.id)
-
+		const bootId = uniqueId()
 		const res = await getReplicator(this.env).registerUser({
 			userId: this.userId,
 			lsn: initialData.lsn,
 			guestFileIds,
-			bootId: this.state.bootId,
+			bootId,
 		})
 
 		if (signal.aborted) {
@@ -361,24 +411,42 @@ export class UserDataSyncer {
 		if (res.type === 'reboot') {
 			this.logEvent({ type: 'not_enough_history_for_fast_reboot', id: this.userId })
 			if (hard) throw new Error('reboot loop, waiting')
-			return this.boot(true, signal)
+			return this.boot({ hard: true, forceRegister: true, signal })
 		}
-
-		const bufferedEvents = this.state.bufferedEvents
-		this.state = {
-			type: 'connected',
-			bootId: this.state.bootId,
+		this._completeBoot({
+			bufferedEvents: this.state.bufferedEvents,
 			sequenceId: res.sequenceId,
 			lastSequenceNumber: res.sequenceNumber,
+			start,
+		})
+	}
+
+	private _completeBoot(args: {
+		bufferedEvents: ZReplicationEvent[]
+		sequenceId: string
+		lastSequenceNumber: number
+		start: number
+	}) {
+		const bufferedEvents = args.bufferedEvents
+		this.state = {
+			type: 'connected',
+			sequenceId: args.sequenceId,
+			lastSequenceNumber: args.lastSequenceNumber,
 		}
 
-		if (bufferedEvents.length > 0) {
-			bufferedEvents.forEach((event) => this.handleReplicationEvent(event))
+		if (bufferedEvents?.length > 0) {
+			for (const event of bufferedEvents) {
+				if (event.sequenceId !== args.sequenceId) {
+					this.log.debug('ignoring irrelevant event', event)
+					return
+				}
+				this.handleReplicationEvent(event)
+			}
 		}
 
 		const end = Date.now()
-		this.logEvent({ type: 'reboot_duration', id: this.userId, duration: end - start })
-		this.log.debug('boot time', end - start, 'ms')
+		this.logEvent({ type: 'reboot_duration', id: this.userId, duration: end - args.start })
+		this.log.debug('boot time', end - args.start, 'ms')
 	}
 
 	// It is important that this method is synchronous!!!!
@@ -404,7 +472,13 @@ export class UserDataSyncer {
 			})
 		} catch (e) {
 			this.captureException(e)
-			this.reboot({ source: 'handleRowUpdateEvent' })
+			this.reboot({
+				// hard: true because it's probably a data corruption issue
+				hard: true,
+				delay: false,
+				source: 'handleRowUpdateEvent',
+				forceRegister: true,
+			})
 		}
 	}
 
@@ -414,12 +488,6 @@ export class UserDataSyncer {
 	handleReplicationEvent(event: ZReplicationEvent) {
 		if (this.state.type === 'init') {
 			this.log.debug('ignoring during init', event)
-			return
-		}
-
-		// ignore irrelevant events
-		if (!event.sequenceId.endsWith(this.state.bootId)) {
-			this.log.debug('ignoring irrelevant event', event)
 			return
 		}
 
@@ -433,7 +501,7 @@ export class UserDataSyncer {
 		if (this.state.sequenceId !== event.sequenceId) {
 			// the replicator has restarted, so we need to reboot
 			this.log.debug('force reboot', this.state, event)
-			this.reboot({ source: 'handleReplicationEvent(force reboot)' })
+			this.reboot({ hard: false, delay: false, source: 'force_reboot', forceRegister: true })
 			return
 		}
 
@@ -443,7 +511,12 @@ export class UserDataSyncer {
 				event.sequenceNumber,
 				this.state.lastSequenceNumber
 			)
-			this.reboot({ source: 'handleReplicationEvent(sequence number mismatch)' })
+			this.reboot({
+				hard: false,
+				delay: false,
+				source: 'sequence_number_mismatch',
+				forceRegister: true,
+			})
 			return
 		}
 
@@ -529,7 +602,13 @@ export class UserDataSyncer {
 		for (const mutation of this.mutations) {
 			if (Date.now() - mutation.timestamp > MUTATION_COMMIT_TIMEOUT) {
 				this.log.debug("Mutations haven't been committed for 10 seconds, rebooting", mutation)
-				this.reboot({ hard: true, source: 'onInterval' })
+				this.reboot({
+					// hard: true to wipe the optimistic updates
+					hard: true,
+					delay: false,
+					source: 'onInterval',
+					forceRegister: true,
+				})
 				break
 			}
 		}
