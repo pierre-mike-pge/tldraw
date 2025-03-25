@@ -955,7 +955,7 @@ function parseUrl(str: string) {
 	}
 }
 
-const validLinkProtocols = new Set(['http:', 'https:', 'mailto:'])
+const validLinkProtocols = new Set(['http:', 'https:', 'mailto:', 'blob:http:'])
 
 /**
  * Validates that a value is a url safe to use as a link.
